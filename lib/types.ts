@@ -93,3 +93,51 @@ export interface ConflictGroup {
   anchorLabel: string;
   annotations: Annotation[];
 }
+
+export interface RestoreSentenceItem {
+  chapterId: string;
+  chapterTitle: string;
+  sentenceId: string;
+  order: number;
+  currentText: string;
+  snapshotText: string;
+}
+
+export interface RestoreAnnotationItem {
+  annotation: Annotation;
+  changedFields: string[];
+}
+
+export interface RestoreMigrationItem {
+  annotationId: string;
+  annotationTitle: string;
+  source: string;
+  tokenText: string;
+  sentenceId: string;
+  sentenceLabel: string;
+}
+
+export interface RestoreConflictItem {
+  key: string;
+  anchorId: string;
+  anchorType: AnchorType;
+  kind: AnnotationKind;
+  anchorLabel: string;
+  resolved: Annotation[];
+  incoming: Annotation[];
+}
+
+export interface RestorePlan {
+  snapshotId: string;
+  snapshotLabel: string;
+  snapshotCreatedAt: string;
+  revertSentences: RestoreSentenceItem[];
+  restoredSentences: RestoreSentenceItem[];
+  keptSentences: RestoreSentenceItem[];
+  newAnnotations: Annotation[];
+  revisedAnnotations: RestoreAnnotationItem[];
+  unchangedAnnotationCount: number;
+  migrations: RestoreMigrationItem[];
+  blockingConflicts: RestoreConflictItem[];
+  mergedChapters: Chapter[];
+}

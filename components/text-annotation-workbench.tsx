@@ -28,6 +28,7 @@ import {
   GitCompareArrows,
   Keyboard,
   Link2,
+  ListChecks,
   ListTree,
   Pencil,
   Plus,
@@ -38,12 +39,14 @@ import {
   Trash2,
   Undo2,
   Wifi,
-  WifiOff
+  WifiOff,
+  X
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { annotationKindLabels, anchorTypeLabels, initialDocument, tokenizeText } from '@/lib/data';
 import {
   STORAGE_KEY,
+  applyRestorePlan,
   clone,
   collectSearchResults,
   createInitialEditorState,
@@ -52,6 +55,7 @@ import {
   getSentence,
   getTargetLabel,
   kindLabel,
+  planRestore,
   removeAnnotationReferences,
   updateSentenceText
 } from '@/lib/editor';
@@ -60,6 +64,7 @@ import type {
   AnnotationKind,
   AnchorType,
   ConflictGroup,
+  RestorePlan,
   Sentence,
   TextDocument,
   ViewMode,
@@ -327,6 +332,37 @@ function AnnotationCard({ annotation, document, selected, onSelect, onUpdate, on
   );
 }
 
+interface RestorePreviewSectionProps {
+  title: string;
+  tone: 'revert' | 'keep';
+  emptyText: string;
+  items: { key: string; heading: string; from?: string; to: string }[];
+}
+
+function RestorePreviewSection({ title, tone, emptyText, items }: RestorePreviewSectionProps) {
+  return (
+    <div className="rounded-xl border border-stone-200 bg-white p-3">
+      <h4 className="text-xs font-semibold text-stone-800">{title}</h4>
+      {items.length ? (
+        <ul className="mt-2 space-y-2">
+          {items.map((item) => (
+            <li key={item.key} className="text-xs leading-5">
+              <div className={`font-semibold ${tone === 'revert' ? 'text-amber-800' : 'text-green-800'}`}>{item.heading}</div>
+              {item.from ? <p className="text-stone-400 line-through">现：{item.from}</p> : null}
+              <p className={tone === 'revert' ? 'text-stone-700' : 'text-stone-600'}>
+                {item.from ? '旧：' : '留：'}
+                {item.to}
+              </p>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="mt-2 text-[11px] text-stone-500">{emptyText}</p>
+      )}
+    </div>
+  );
+}
+
 export function TextAnnotationWorkbench() {
   const [state, dispatch] = useReducer(editorReducer, initialDocument, createInitialEditorState);
   const [hydrated, setHydrated] = useState(false);
@@ -339,6 +375,7 @@ export function TextAnnotationWorkbench() {
   const [leftVersionId, setLeftVersionId] = useState('snapshot-base');
   const [rightVersionId, setRightVersionId] = useState('current');
   const [snapshotLabel, setSnapshotLabel] = useState('');
+  const [restorePlan, setRestorePlan] = useState<RestorePlan | null>(null);
   const [apiMessage, setApiMessage] = useState('模拟接口待命');
   const searchRef = useRef<HTMLInputElement | null>(null);
 
@@ -568,17 +605,61 @@ export function TextAnnotationWorkbench() {
     setLeftVersionId(id);
   }
 
-  function restoreVersion(versionId: string) {
-    const version = document.snapshots.find((item) => item.id === versionId);
-    if (!version || !window.confirm(`将“${version.label}”恢复为当前草稿？`)) return;
+  /**
+   * 恢复旧快照分两步：先只生成恢复清单（不写入），列出将采用旧稿的句子、
+   * 将保留的新注释/修订、将迁移的词级引用；若存在阻断冲突则停在预览。
+   */
+  function requestRestoreVersion(versionId: string) {
+    const plan = planRestore(document, versionId);
+    if (!plan) return;
+    setRestorePlan(plan);
+    setApiMessage(
+      plan.blockingConflicts.length
+        ? `恢复清单已生成，但发现 ${plan.blockingConflicts.length} 组冲突在快照之后出现新来源，已暂停写入`
+        : `已生成“${plan.snapshotLabel}”的恢复清单，确认后才会写入`
+    );
+  }
+
+  function closeRestorePreview() {
+    setRestorePlan(null);
+  }
+
+  function confirmRestore() {
+    if (!restorePlan) return;
+    // 确认前按最新草稿重新核算，避免预览后又发生编辑。
+    const fresh = planRestore(document, restorePlan.snapshotId);
+    if (!fresh) return;
+    if (fresh.blockingConflicts.length) {
+      setRestorePlan(fresh);
+      setApiMessage(`仍有 ${fresh.blockingConflicts.length} 组冲突待处理，未写入任何句子或注释`);
+      return;
+    }
+    const plan = fresh;
     dispatch({
       type: 'commit',
-      label: `恢复版本：${version.label}`,
+      label: `恢复版本：${plan.snapshotLabel}（保留后补内容）`,
       mutate: (doc) => {
-        doc.chapters = clone(version.chapters);
-        doc.annotations = clone(version.annotations);
+        applyRestorePlan(doc, plan);
       }
     });
+    setApiMessage(
+      `已恢复“${plan.snapshotLabel}”：${plan.revertSentences.length} 句采用旧稿，保留 ${plan.newAnnotations.length} 条新注释` +
+        `${plan.migrations.length ? `，${plan.migrations.length} 条词级引用迁至所属句` : ''}`
+    );
+    setRestorePlan(null);
+  }
+
+  function jumpToBlockingConflict(anchorId: string) {
+    for (const chapter of document.chapters) {
+      const sentence = chapter.sentences.find(
+        (item) => item.id === anchorId || item.tokens.some((token) => token.id === anchorId)
+      );
+      if (sentence) {
+        dispatch({ type: 'selectSentence', chapterId: chapter.id, sentenceId: sentence.id });
+        break;
+      }
+    }
+    setRightTab('conflicts');
   }
 
   const comparison = useMemo(() => {
@@ -1014,6 +1095,185 @@ export function TextAnnotationWorkbench() {
                 <Tab key="versions" title="版本">
                   <ScrollShadow className="max-h-[calc(100vh-210px)]">
                     <div className="space-y-4 pr-1">
+                      {restorePlan ? (
+                        <Card shadow="none" className="border-2 border-amber-300 bg-amber-50/60">
+                          <CardHeader className="px-4 pb-0 pt-4">
+                            <div className="flex w-full items-start gap-2">
+                              <ListChecks className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
+                              <div className="min-w-0">
+                                <h3 className="text-sm font-semibold text-stone-900">
+                                  恢复清单 · {restorePlan.snapshotLabel}
+                                </h3>
+                                <p className="mt-0.5 text-[11px] text-stone-500">
+                                  快照保存于 {new Date(restorePlan.snapshotCreatedAt).toLocaleString('zh-CN')} ·
+                                  当前仅为预览，尚未写入
+                                </p>
+                              </div>
+                              <Button
+                                isIconOnly
+                                size="sm"
+                                variant="light"
+                                aria-label="关闭恢复清单"
+                                onPress={closeRestorePreview}
+                              >
+                                <X className="h-4 w-4" />
+                              </Button>
+                            </div>
+                          </CardHeader>
+                          <CardBody className="gap-4 px-4 py-3">
+                            {restorePlan.blockingConflicts.length ? (
+                              <div className="space-y-2 rounded-xl border border-red-200 bg-red-50 p-3">
+                                <div className="flex items-center gap-2 text-sm font-semibold text-red-800">
+                                  <AlertTriangle className="h-4 w-4" />
+                                  {restorePlan.blockingConflicts.length} 组冲突在旧快照中已解决，当前又出现新来源
+                                </div>
+                                <p className="text-xs leading-5 text-red-700">
+                                  请先在「冲突」页处理以下冲突，再重新生成恢复清单；确认不会写入任何句子或注释。
+                                </p>
+                                {restorePlan.blockingConflicts.map((conflict) => (
+                                  <div key={conflict.key} className="rounded-lg border border-red-200 bg-white p-2.5 text-xs">
+                                    <div className="flex flex-wrap items-center gap-2">
+                                      <Chip size="sm" color="danger" variant="flat">{kindLabel(conflict.kind)}</Chip>
+                                      <span className="font-semibold text-stone-800">{conflict.anchorLabel}</span>
+                                    </div>
+                                    <div className="mt-1.5 space-y-1">
+                                      <p className="text-stone-600">
+                                        快照中已选用：
+                                        {conflict.resolved.map((item) => ` ${item.source}`).join('；')}
+                                      </p>
+                                      <p className="font-medium text-red-700">
+                                        新来源：
+                                        {conflict.incoming.map((item) => ` ${item.source}（${item.title}）`).join('；')}
+                                      </p>
+                                    </div>
+                                    {conflicts.some((group) => group.anchorId === conflict.anchorId && group.kind === conflict.kind) ? (
+                                      <Button
+                                        size="sm"
+                                        color="danger"
+                                        variant="flat"
+                                        className="mt-2"
+                                        onPress={() => jumpToBlockingConflict(conflict.anchorId)}
+                                      >
+                                        前往冲突页处理
+                                      </Button>
+                                    ) : (
+                                      <p className="mt-2 text-[11px] text-stone-500">
+                                        相关注释均已标记解决；若仍要恢复，请先在注释面板调整状态。
+                                      </p>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            ) : null}
+
+                            <RestorePreviewSection
+                              title={`采用旧稿的句子（${restorePlan.revertSentences.length}）`}
+                              tone="revert"
+                              emptyText="没有句子将被旧稿覆盖。"
+                              items={restorePlan.revertSentences.map((item) => ({
+                                key: item.sentenceId,
+                                heading: `${item.chapterTitle} · 第 ${item.order} 句`,
+                                from: item.currentText,
+                                to: item.snapshotText
+                              }))}
+                            />
+                            <RestorePreviewSection
+                              title={`随旧稿恢复的句子（${restorePlan.restoredSentences.length}）`}
+                              tone="revert"
+                              emptyText="旧稿中的句子当前均存在。"
+                              items={restorePlan.restoredSentences.map((item) => ({
+                                key: item.sentenceId,
+                                heading: `${item.chapterTitle} · 第 ${item.order} 句`,
+                                to: item.snapshotText
+                              }))}
+                            />
+                            <RestorePreviewSection
+                              title={`保留的新句子（${restorePlan.keptSentences.length}）`}
+                              tone="keep"
+                              emptyText="快照之后没有新增句子。"
+                              items={restorePlan.keptSentences.map((item) => ({
+                                key: item.sentenceId,
+                                heading: `${item.chapterTitle} · 第 ${item.order} 句`,
+                                to: item.currentText
+                              }))}
+                            />
+
+                            <div className="rounded-xl border border-stone-200 bg-white p-3">
+                              <h4 className="text-xs font-semibold text-stone-800">
+                                保留的新注释（{restorePlan.newAnnotations.length}）与修订
+                                （{restorePlan.revisedAnnotations.length}）
+                              </h4>
+                              <p className="mt-1 text-[11px] text-stone-500">
+                                快照之后补写的注释和编辑一律保留当前版本；另有 {restorePlan.unchangedAnnotationCount} 条与旧稿一致，不重复列出。
+                              </p>
+                              <ul className="mt-2 space-y-1.5">
+                                {restorePlan.newAnnotations.map((annotation) => (
+                                  <li key={annotation.id} className="text-xs leading-5 text-stone-700">
+                                    <Chip size="sm" color="success" variant="flat" className="mr-1.5">新增</Chip>
+                                    <b>{annotation.title}</b>
+                                    <span className="text-stone-500"> · {annotation.source} · {kindLabel(annotation.kind)}</span>
+                                  </li>
+                                ))}
+                                {restorePlan.revisedAnnotations.map(({ annotation, changedFields }) => (
+                                  <li key={annotation.id} className="text-xs leading-5 text-stone-700">
+                                    <Chip size="sm" color="primary" variant="flat" className="mr-1.5">修订</Chip>
+                                    <b>{annotation.title}</b>
+                                    <span className="text-stone-500">
+                                      {' '}· {annotation.source} · 保留字段：{changedFields.join('、')}
+                                    </span>
+                                  </li>
+                                ))}
+                                {!restorePlan.newAnnotations.length && !restorePlan.revisedAnnotations.length ? (
+                                  <li className="text-[11px] text-stone-500">快照之后没有新增或修订注释。</li>
+                                ) : null}
+                              </ul>
+                            </div>
+
+                            <div className="rounded-xl border border-stone-200 bg-white p-3">
+                              <h4 className="text-xs font-semibold text-stone-800">
+                                词级引用迁移（{restorePlan.migrations.length}）
+                              </h4>
+                              <p className="mt-1 text-[11px] text-stone-500">
+                                旧稿中相应词语已不存在，这些词级注释将改挂到所属句，引用关系不悬空。
+                              </p>
+                              {restorePlan.migrations.length ? (
+                                <ul className="mt-2 space-y-1.5">
+                                  {restorePlan.migrations.map((migration) => (
+                                    <li key={migration.annotationId} className="text-xs leading-5 text-stone-700">
+                                      <Chip size="sm" color="warning" variant="flat" className="mr-1.5">迁移</Chip>
+                                      <b>{migration.annotationTitle}</b>
+                                      <span className="text-stone-500">
+                                        {' '}· “{migration.tokenText}” → {migration.sentenceLabel}
+                                      </span>
+                                    </li>
+                                  ))}
+                                </ul>
+                              ) : (
+                                <p className="mt-2 text-[11px] text-stone-500">没有需要迁移的词级引用。</p>
+                              )}
+                            </div>
+
+                            <div className="flex gap-2">
+                              <Button
+                                size="sm"
+                                color="primary"
+                                isDisabled={restorePlan.blockingConflicts.length > 0}
+                                startContent={<Check className="h-4 w-4" />}
+                                onPress={confirmRestore}
+                              >
+                                按清单恢复
+                              </Button>
+                              <Button size="sm" variant="light" onPress={closeRestorePreview}>取消</Button>
+                              {restorePlan.blockingConflicts.length ? (
+                                <span className="self-center text-[11px] font-medium text-red-700">
+                                  存在阻断冲突，恢复按钮已停用
+                                </span>
+                              ) : null}
+                            </div>
+                          </CardBody>
+                        </Card>
+                      ) : null}
+
                       <div className="rounded-xl border border-stone-200 p-3">
                         <h3 className="flex items-center gap-2 font-semibold text-stone-900"><GitCompareArrows className="h-4 w-4" />保存校订快照</h3>
                         <Input className="mt-3" size="sm" label="版本名称" value={snapshotLabel} onValueChange={setSnapshotLabel} placeholder="如：参校本会校后" />
@@ -1047,7 +1307,7 @@ export function TextAnnotationWorkbench() {
                       <div className="rounded-xl border border-stone-200">
                         <div className="flex items-center justify-between border-b border-stone-100 px-3 py-2 text-xs">
                           <span>{comparison.changes.length} 处差异</span>
-                          {comparison.left ? <Button size="sm" variant="light" onPress={() => restoreVersion(comparison.left!.id)}>恢复左侧</Button> : null}
+                          {comparison.left ? <Button size="sm" variant="light" startContent={<ListChecks className="h-3.5 w-3.5" />} onPress={() => requestRestoreVersion(comparison.left!.id)}>恢复左侧（预览清单）</Button> : null}
                         </div>
                         <div className="max-h-72 space-y-2 overflow-y-auto p-2">
                           {comparison.changes.map((change) => (

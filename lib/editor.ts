@@ -1,8 +1,11 @@
 import type {
   Annotation,
   AnnotationKind,
+  Chapter,
   ConflictGroup,
   EditorState,
+  RestoreConflictItem,
+  RestorePlan,
   SearchResult,
   Sentence,
   TextDocument,
@@ -308,4 +311,274 @@ export function toWorkspace(document: TextDocument, fallback: WorkspaceState): W
     query: fallback.query,
     dirty: false
   };
+}
+
+const RESTORE_FIELD_LABELS: Array<{ key: keyof Annotation; label: string }> = [
+  { key: 'title', label: '标题' },
+  { key: 'body', label: '正文' },
+  { key: 'source', label: '来源' },
+  { key: 'kind', label: '类型' },
+  { key: 'anchorId', label: '引用目标' },
+  { key: 'anchorType', label: '引用级别' },
+  { key: 'references', label: '引用注释' },
+  { key: 'tags', label: '标签' }
+];
+
+function describeAnchorInChapters(
+  chapters: Chapter[],
+  anchorId: string,
+  anchorType: Annotation['anchorType']
+): string {
+  for (const chapter of chapters) {
+    if (anchorType === 'chapter' && chapter.id === anchorId) return chapter.title;
+    const sentence = chapter.sentences.find((item) => item.id === anchorId);
+    if (anchorType === 'sentence' && sentence) return `${chapter.title} · 第 ${sentence.order} 句`;
+    for (const item of chapter.sentences) {
+      const token = item.tokens.find((token) => token.id === anchorId);
+      if (token) return `${chapter.title} · “${token.text.trim()}”`;
+    }
+  }
+  return '文本片段';
+}
+
+interface EffectiveAnnotation {
+  annotation: Annotation;
+  anchorId: string;
+  anchorType: Annotation['anchorType'];
+}
+
+/**
+ * 生成旧快照的恢复清单：句子按 ID 合并（旧稿正文覆盖当前句，新增句保留），
+ * 注释一律保留当前版本；旧稿中已消失的词级引用将迁移到所属句。
+ * 同时检查“快照中已解决、但当前因新来源再次出现”的冲突组，作为阻断项返回。
+ * 该函数不修改入参，任何写入都由 applyRestorePlan 在用户确认后执行。
+ */
+export function planRestore(document: TextDocument, snapshotId: string): RestorePlan | null {
+  const snapshot = document.snapshots.find((item) => item.id === snapshotId);
+  if (!snapshot) return null;
+
+  const mergedChapters: Chapter[] = [];
+  const revertSentences: RestorePlan['revertSentences'] = [];
+  const restoredSentences: RestorePlan['restoredSentences'] = [];
+  const keptSentences: RestorePlan['keptSentences'] = [];
+
+  snapshot.chapters.forEach((snapshotChapter, index) => {
+    const currentChapter = document.chapters.find((item) => item.id === snapshotChapter.id);
+    const mergedChapter: Chapter = {
+      ...clone(snapshotChapter),
+      order: currentChapter?.order ?? snapshotChapter.order,
+      sentences: []
+    };
+    for (const snapshotSentence of snapshotChapter.sentences) {
+      const currentSentence = currentChapter?.sentences.find((item) => item.id === snapshotSentence.id);
+      mergedChapter.sentences.push(clone(snapshotSentence));
+      if (!currentSentence) {
+        restoredSentences.push({
+          chapterId: snapshotChapter.id,
+          chapterTitle: snapshotChapter.title,
+          sentenceId: snapshotSentence.id,
+          order: snapshotSentence.order,
+          currentText: '',
+          snapshotText: snapshotSentence.text
+        });
+      } else if (currentSentence.text !== snapshotSentence.text) {
+        revertSentences.push({
+          chapterId: snapshotChapter.id,
+          chapterTitle: snapshotChapter.title,
+          sentenceId: snapshotSentence.id,
+          order: snapshotSentence.order,
+          currentText: currentSentence.text,
+          snapshotText: snapshotSentence.text
+        });
+      }
+    }
+    for (const currentSentence of currentChapter?.sentences ?? []) {
+      if (!snapshotChapter.sentences.some((item) => item.id === currentSentence.id)) {
+        mergedChapter.sentences.push(clone(currentSentence));
+        keptSentences.push({
+          chapterId: snapshotChapter.id,
+          chapterTitle: snapshotChapter.title,
+          sentenceId: currentSentence.id,
+          order: currentSentence.order,
+          currentText: currentSentence.text,
+          snapshotText: ''
+        });
+      }
+    }
+    mergedChapters[index] = mergedChapter;
+  });
+
+  // 快照之后新增的章节（当前界面无此操作，仍稳妥保留）。
+  for (const currentChapter of document.chapters) {
+    if (!snapshot.chapters.some((item) => item.id === currentChapter.id)) {
+      mergedChapters.push(clone(currentChapter));
+      for (const currentSentence of currentChapter.sentences) {
+        keptSentences.push({
+          chapterId: currentChapter.id,
+          chapterTitle: currentChapter.title,
+          sentenceId: currentSentence.id,
+          order: currentSentence.order,
+          currentText: currentSentence.text,
+          snapshotText: ''
+        });
+      }
+    }
+  }
+
+  // 合并后仍然存在的词级 token 索引；不在其中的词级引用需要迁移到所属句。
+  const mergedTokenIds = new Set<string>();
+  const mergedSentenceById = new Map<string, { chapter: Chapter; sentence: Sentence }>();
+  for (const chapter of mergedChapters) {
+    for (const sentence of chapter.sentences) {
+      mergedSentenceById.set(sentence.id, { chapter, sentence });
+      for (const token of sentence.tokens) mergedTokenIds.add(token.id);
+    }
+  }
+
+  // 快照侧 token → 所属句，用于把快照分组的词级锚点归一化到合并后的锚点。
+  const snapshotTokenOwner = new Map<string, string>();
+  for (const chapter of snapshot.chapters) {
+    for (const sentence of chapter.sentences) {
+      for (const token of sentence.tokens) snapshotTokenOwner.set(token.id, sentence.id);
+    }
+  }
+
+  const currentSentenceByToken = new Map<string, { chapter: Chapter; sentence: Sentence; tokenText: string }>();
+  for (const chapter of document.chapters) {
+    for (const sentence of chapter.sentences) {
+      for (const token of sentence.tokens) {
+        currentSentenceByToken.set(token.id, { chapter, sentence, tokenText: token.text.trim() });
+      }
+    }
+  }
+
+  // 任一侧的词级锚点在合并稿中消失时，归一化到所属句。
+  function toMergedAnchor(anchorId: string, anchorType: Annotation['anchorType']) {
+    if (anchorType === 'word' && !mergedTokenIds.has(anchorId)) {
+      const ownerId = snapshotTokenOwner.get(anchorId) ?? currentSentenceByToken.get(anchorId)?.sentence.id;
+      if (ownerId && mergedSentenceById.has(ownerId)) {
+        return { anchorId: ownerId, anchorType: 'sentence' as const };
+      }
+    }
+    return { anchorId, anchorType };
+  }
+
+  const migrations: RestorePlan['migrations'] = [];
+  const effectiveByAnnotationId = new Map<string, EffectiveAnnotation>();
+  for (const annotation of document.annotations) {
+    let { anchorId, anchorType } = annotation;
+    if (anchorType === 'word' && !mergedTokenIds.has(anchorId)) {
+      const owner = currentSentenceByToken.get(anchorId);
+      const ownerSentence = owner
+        ? { id: owner.sentence.id, label: `${owner.chapter.title} · 第 ${owner.sentence.order} 句`, tokenText: owner.tokenText }
+        : undefined;
+      if (ownerSentence) {
+        migrations.push({
+          annotationId: annotation.id,
+          annotationTitle: annotation.title,
+          source: annotation.source,
+          tokenText: ownerSentence.tokenText,
+          sentenceId: ownerSentence.id,
+          sentenceLabel: ownerSentence.label
+        });
+        anchorId = ownerSentence.id;
+        anchorType = 'sentence';
+      }
+    }
+    effectiveByAnnotationId.set(annotation.id, { annotation, anchorId, anchorType });
+  }
+
+  // 注释清单：新增、修订保留当前版本；快照之后删除的不恢复。
+  const newAnnotations: Annotation[] = [];
+  const revisedAnnotations: RestorePlan['revisedAnnotations'] = [];
+  let unchangedAnnotationCount = 0;
+  for (const annotation of document.annotations) {
+    const snapshotAnnotation = snapshot.annotations.find((item) => item.id === annotation.id);
+    if (!snapshotAnnotation) {
+      newAnnotations.push(annotation);
+      continue;
+    }
+    const changedFields = RESTORE_FIELD_LABELS.filter(({ key }) => {
+      const currentValue = annotation[key];
+      const snapshotValue = snapshotAnnotation[key];
+      return Array.isArray(currentValue) || Array.isArray(snapshotValue)
+        ? JSON.stringify(currentValue) !== JSON.stringify(snapshotValue)
+        : currentValue !== snapshotValue;
+    }).map(({ label }) => label);
+    if (changedFields.length) {
+      revisedAnnotations.push({ annotation, changedFields });
+    } else {
+      unchangedAnnotationCount += 1;
+    }
+  }
+
+  // 阻断项：快照里同一“引用目标 + 类型”的冲突已全部解决，
+  // 而当前（合并引用迁移后）又出现快照之外的新来源。
+  const blockingConflicts: RestoreConflictItem[] = [];
+  const snapshotGroups = new Map<string, Annotation[]>();
+  for (const annotation of snapshot.annotations) {
+    const merged = toMergedAnchor(annotation.anchorId, annotation.anchorType);
+    const key = `${merged.anchorId}:${annotation.kind}`;
+    snapshotGroups.set(key, [...(snapshotGroups.get(key) ?? []), annotation]);
+  }
+  const effectiveGroups = new Map<string, EffectiveAnnotation[]>();
+  for (const effective of effectiveByAnnotationId.values()) {
+    const key = `${effective.anchorId}:${effective.annotation.kind}`;
+    effectiveGroups.set(key, [...(effectiveGroups.get(key) ?? []), effective]);
+  }
+  for (const [key, snapshotItems] of snapshotGroups) {
+    const resolved = snapshotItems.filter((item) => item.conflictState === 'resolved');
+    const distinctBodies = new Set(resolved.map((item) => item.body.trim()));
+    if (resolved.length < 2 || distinctBodies.size < 2) continue;
+    const snapshotIds = new Set(snapshotItems.map((item) => item.id));
+    const currentItems = effectiveGroups.get(key) ?? [];
+    const incoming = currentItems
+      .filter((item) => !snapshotIds.has(item.annotation.id) && item.annotation.conflictState === 'open')
+      .map((item) => item.annotation);
+    const currentBodies = new Set(currentItems.map((item) => item.annotation.body.trim()));
+    if (incoming.length && currentBodies.size > 1) {
+      const first = snapshotItems[0];
+      const merged = toMergedAnchor(first.anchorId, first.anchorType);
+      blockingConflicts.push({
+        key,
+        anchorId: merged.anchorId,
+        anchorType: merged.anchorType,
+        kind: first.kind,
+        anchorLabel: describeAnchorInChapters(mergedChapters, merged.anchorId, merged.anchorType),
+        resolved,
+        incoming
+      });
+    }
+  }
+
+  return {
+    snapshotId: snapshot.id,
+    snapshotLabel: snapshot.label,
+    snapshotCreatedAt: snapshot.createdAt,
+    revertSentences,
+    restoredSentences,
+    keptSentences,
+    newAnnotations,
+    revisedAnnotations,
+    unchangedAnnotationCount,
+    migrations,
+    blockingConflicts,
+    mergedChapters
+  };
+}
+
+/** 按恢复清单写入：仅替换章节正文，并迁移清单中的词级引用；当前注释整体保留。 */
+export function applyRestorePlan(document: TextDocument, plan: RestorePlan) {
+  document.chapters = clone(plan.mergedChapters);
+  const migrationBySentence = new Map(plan.migrations.map((item) => [item.annotationId, item.sentenceId]));
+  for (const annotation of document.annotations) {
+    const sentenceId = migrationBySentence.get(annotation.id);
+    if (!sentenceId) continue;
+    annotation.anchorId = sentenceId;
+    annotation.anchorType = 'sentence';
+    annotation.title = annotation.title.endsWith('（引用已随修订迁移）')
+      ? annotation.title
+      : `${annotation.title}（引用已随修订迁移）`;
+    annotation.updatedAt = new Date().toISOString();
+  }
 }
