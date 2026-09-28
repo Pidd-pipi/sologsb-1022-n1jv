@@ -93,3 +93,56 @@ export interface ConflictGroup {
   anchorLabel: string;
   annotations: Annotation[];
 }
+
+export interface RestoreSentenceEntry {
+  id: string;
+  chapterId: string;
+  chapterTitle: string;
+  order: number;
+}
+
+export interface RestoreAnnotationEntry {
+  id: string;
+  title: string;
+  source: string;
+  kind: AnnotationKind;
+  anchorLabel: string;
+  body: string;
+}
+
+export interface RestoreMigrationEntry extends RestoreAnnotationEntry {
+  wordText: string;
+  sentenceId: string;
+  sentenceLabel: string;
+}
+
+export interface RestoreRegressedConflict {
+  key: string;
+  kind: AnnotationKind;
+  anchorLabel: string;
+  snapshotSources: string[];
+  currentSources: { annotationId: string; title: string; source: string; body: string }[];
+}
+
+export interface RestorePlan {
+  snapshotId: string;
+  snapshotLabel: string;
+  /** 旧稿与当前并存但正文不同：恢复后采用旧稿文字 */
+  revertSentences: (RestoreSentenceEntry & { currentText: string; snapshotText: string })[];
+  /** 快照之后新增的句子：恢复后保留 */
+  newSentences: (RestoreSentenceEntry & { text: string })[];
+  /** 当前已删、旧稿中存在的句子：随旧稿恢复 */
+  restoredSentences: (RestoreSentenceEntry & { text: string })[];
+  /** 快照之后新增的注释：恢复后保留 */
+  newAnnotations: RestoreAnnotationEntry[];
+  /** 快照后被修订的既有注释：恢复后保留当前修订 */
+  revisedAnnotations: RestoreAnnotationEntry[];
+  /** 当前已删、旧稿中存在的注释：随旧稿恢复 */
+  restoredAnnotations: RestoreAnnotationEntry[];
+  /** 旧稿正文中目标词语已不存在：词级引用迁到所属句 */
+  migratedWordAnnotations: RestoreMigrationEntry[];
+  /** 旧快照已解决、当前又出现新来源的冲突；存在时禁止写入 */
+  regressedConflicts: RestoreRegressedConflict[];
+  chapters: Chapter[];
+  annotations: Annotation[];
+}

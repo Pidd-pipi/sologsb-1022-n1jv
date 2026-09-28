@@ -9,6 +9,11 @@ import {
   Divider,
   Input,
   Kbd,
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalFooter,
+  ModalHeader,
   ScrollShadow,
   Select,
   SelectItem,
@@ -19,6 +24,7 @@ import {
 } from '@heroui/react';
 import {
   AlertTriangle,
+  ArrowDownToLine,
   BookOpen,
   Check,
   ChevronRight,
@@ -33,17 +39,20 @@ import {
   Plus,
   Printer,
   Redo2,
+  RotateCcw,
   Save,
   Search,
   Trash2,
   Undo2,
   Wifi,
-  WifiOff
+  WifiOff,
+  X
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { type ReactNode, useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { annotationKindLabels, anchorTypeLabels, initialDocument, tokenizeText } from '@/lib/data';
 import {
   STORAGE_KEY,
+  applyRestorePlan,
   clone,
   collectSearchResults,
   createInitialEditorState,
@@ -52,6 +61,7 @@ import {
   getSentence,
   getTargetLabel,
   kindLabel,
+  planRestore,
   removeAnnotationReferences,
   updateSentenceText
 } from '@/lib/editor';
@@ -60,6 +70,7 @@ import type {
   AnnotationKind,
   AnchorType,
   ConflictGroup,
+  RestorePlan,
   Sentence,
   TextDocument,
   ViewMode,
@@ -327,6 +338,77 @@ function AnnotationCard({ annotation, document, selected, onSelect, onUpdate, on
   );
 }
 
+interface RestoreSectionItem {
+  key: string;
+  title: string;
+  detail: string;
+}
+
+function RestoreStatChip({
+  tone,
+  icon,
+  count,
+  label
+}: {
+  tone: 'amber' | 'green' | 'blue' | 'orange';
+  icon: ReactNode;
+  count: number;
+  label: string;
+}) {
+  const tones = {
+    amber: 'border-amber-200 bg-amber-50 text-amber-800',
+    green: 'border-green-200 bg-green-50 text-green-800',
+    blue: 'border-sky-200 bg-sky-50 text-sky-800',
+    orange: 'border-orange-200 bg-orange-50 text-orange-800'
+  } as const;
+  return (
+    <div className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-xs ${tones[tone]}`}>
+      {icon}
+      <span className="font-bold tabular-nums">{count}</span>
+      <span>{label}</span>
+    </div>
+  );
+}
+
+function RestorePreviewSection({
+  tone,
+  title,
+  empty,
+  items
+}: {
+  tone: 'amber' | 'green' | 'blue' | 'orange';
+  title: string;
+  empty: string;
+  items: RestoreSectionItem[];
+}) {
+  const accents = {
+    amber: 'border-l-amber-400',
+    green: 'border-l-green-400',
+    blue: 'border-l-sky-400',
+    orange: 'border-l-orange-400'
+  } as const;
+  return (
+    <section className="rounded-xl border border-stone-200">
+      <h3 className="border-b border-stone-100 px-3 py-2 text-xs font-bold text-stone-800">
+        {title}
+        <span className="ml-2 font-normal text-stone-400">{items.length} 项</span>
+      </h3>
+      {items.length ? (
+        <ul className="max-h-56 space-y-1.5 overflow-y-auto p-2">
+          {items.map((item) => (
+            <li key={item.key} className={`rounded-md border border-stone-100 bg-stone-50 p-2 text-xs border-l-2 ${accents[tone]}`}>
+              <div className="font-semibold text-stone-800">{item.title}</div>
+              <p className="mt-0.5 line-clamp-2 leading-5 text-stone-600">{item.detail}</p>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="px-3 py-2 text-[11px] text-stone-400">{empty}</p>
+      )}
+    </section>
+  );
+}
+
 export function TextAnnotationWorkbench() {
   const [state, dispatch] = useReducer(editorReducer, initialDocument, createInitialEditorState);
   const [hydrated, setHydrated] = useState(false);
@@ -340,6 +422,8 @@ export function TextAnnotationWorkbench() {
   const [rightVersionId, setRightVersionId] = useState('current');
   const [snapshotLabel, setSnapshotLabel] = useState('');
   const [apiMessage, setApiMessage] = useState('模拟接口待命');
+  const [restorePlan, setRestorePlan] = useState<RestorePlan | null>(null);
+  const [restoreBlockedAcknowledged, setRestoreBlockedAcknowledged] = useState(false);
   const searchRef = useRef<HTMLInputElement | null>(null);
 
   const workspace = state.workspace;
@@ -568,17 +652,57 @@ export function TextAnnotationWorkbench() {
     setLeftVersionId(id);
   }
 
-  function restoreVersion(versionId: string) {
-    const version = document.snapshots.find((item) => item.id === versionId);
-    if (!version || !window.confirm(`将“${version.label}”恢复为当前草稿？`)) return;
+  function requestRestoreVersion(versionId: string) {
+    const plan = planRestore(document, versionId);
+    if (!plan) return;
+    setRestoreBlockedAcknowledged(false);
+    setRestorePlan(plan);
+  }
+
+  function closeRestorePreview() {
+    setRestorePlan(null);
+    setRestoreBlockedAcknowledged(false);
+  }
+
+  function confirmRestore() {
+    if (!restorePlan) return;
+    // 闸门：旧快照已解决的冲突在当前出现新来源时，停在预览，不写入任何句子或注释
+    if (restorePlan.regressedConflicts.length) {
+      setRestoreBlockedAcknowledged(true);
+      return;
+    }
+    const plan = restorePlan;
     dispatch({
       type: 'commit',
-      label: `恢复版本：${version.label}`,
+      label: `恢复版本：${plan.snapshotLabel}`,
       mutate: (doc) => {
-        doc.chapters = clone(version.chapters);
-        doc.annotations = clone(version.annotations);
+        applyRestorePlan(doc, plan);
       }
     });
+    setApiMessage(
+      `已恢复“${plan.snapshotLabel}”：${plan.revertSentences.length} 句采用旧稿，` +
+        `保留 ${plan.newAnnotations.length + plan.revisedAnnotations.length} 条新注释与修订，` +
+        `${plan.migratedWordAnnotations.length} 条词级引用迁到所属句。`
+    );
+    closeRestorePreview();
+  }
+
+  function focusRegressedAnnotation(annotationId: string) {
+    const target = document.annotations.find((item) => item.id === annotationId);
+    if (target) {
+      for (const chapter of document.chapters) {
+        const sentence =
+          chapter.sentences.find((item) => item.id === target.anchorId) ??
+          chapter.sentences.find((item) => item.tokens.some((token) => token.id === target.anchorId));
+        if (sentence) {
+          dispatch({ type: 'selectSentence', chapterId: chapter.id, sentenceId: sentence.id });
+          break;
+        }
+      }
+    }
+    dispatch({ type: 'selectAnnotation', annotationId });
+    setRightTab('annotations');
+    closeRestorePreview();
   }
 
   const comparison = useMemo(() => {
@@ -593,6 +717,7 @@ export function TextAnnotationWorkbench() {
     const leftSentences = new Map(
       left.chapters.flatMap((chapter) => chapter.sentences.map((sentence) => [sentence.id, { chapter, sentence }] as const))
     );
+    const rightSentenceIds = new Set(right.chapters.flatMap((chapter) => chapter.sentences.map((sentence) => sentence.id)));
     for (const chapter of right.chapters) {
       for (const sentence of chapter.sentences) {
         const previous = leftSentences.get(sentence.id);
@@ -607,10 +732,70 @@ export function TextAnnotationWorkbench() {
         }
       }
     }
-    const leftAnnotationIds = new Set(left.annotations.map((item) => item.id));
+    for (const [id, previous] of leftSentences) {
+      if (!rightSentenceIds.has(id)) {
+        changes.push({
+          id,
+          label: `${previous.chapter.title} · 句子已删除`,
+          detail: previous.sentence.text
+        });
+      }
+    }
+
+    const leftDocForLabels: TextDocument = {
+      id: 'compare-left',
+      title: '',
+      author: '',
+      edition: '',
+      chapters: left.chapters,
+      annotations: left.annotations,
+      snapshots: [],
+      updatedAt: ''
+    };
+    const rightDocForLabels: TextDocument = {
+      id: 'compare-right',
+      title: '',
+      author: '',
+      edition: '',
+      chapters: right.chapters,
+      annotations: right.annotations,
+      snapshots: [],
+      updatedAt: ''
+    };
+    const leftAnnotations = new Map(left.annotations.map((item) => [item.id, item]));
+    const rightAnnotationIds = new Set(right.annotations.map((item) => item.id));
     for (const annotation of right.annotations) {
-      if (!leftAnnotationIds.has(annotation.id)) {
-        changes.push({ id: annotation.id, label: `新增注释 · ${annotation.title}`, detail: annotation.body });
+      const previous = leftAnnotations.get(annotation.id);
+      const anchorLabel = getTargetLabel(rightDocForLabels, annotation);
+      if (!previous) {
+        changes.push({
+          id: annotation.id,
+          label: `新增注释 · ${annotation.title}`,
+          detail: `${anchorLabel}｜${annotation.source}：${annotation.body}`
+        });
+      } else {
+        const details: string[] = [];
+        if (previous.title !== annotation.title) details.push(`标题：${previous.title} → ${annotation.title}`);
+        if (previous.body !== annotation.body) details.push(`正文：${previous.body} → ${annotation.body}`);
+        if (previous.source !== annotation.source) details.push(`来源：${previous.source} → ${annotation.source}`);
+        const migrated = previous.anchorId !== annotation.anchorId || previous.anchorType !== annotation.anchorType;
+        if (migrated) {
+          details.push(
+            `引用：${getTargetLabel(leftDocForLabels, previous)} → ${anchorLabel}（词级引用迁到所属句）`
+          );
+        }
+        if (details.length) {
+          changes.push({ id: annotation.id, label: `注释修订 · ${annotation.title}`, detail: details.join('；') });
+        }
+      }
+    }
+    for (const annotation of left.annotations) {
+      if (!rightAnnotationIds.has(annotation.id)) {
+        changes.push({
+          id: annotation.id,
+          label: `注释移除 · ${annotation.title}`,
+          detail: `${getTargetLabel(leftDocForLabels, annotation)}｜${annotation.source}：${annotation.body}`
+        });
       }
     }
     return { left, right, changes };
@@ -1047,8 +1232,20 @@ export function TextAnnotationWorkbench() {
                       <div className="rounded-xl border border-stone-200">
                         <div className="flex items-center justify-between border-b border-stone-100 px-3 py-2 text-xs">
                           <span>{comparison.changes.length} 处差异</span>
-                          {comparison.left ? <Button size="sm" variant="light" onPress={() => restoreVersion(comparison.left!.id)}>恢复左侧</Button> : null}
+                          {comparison.left ? (
+                            <Button
+                              size="sm"
+                              variant="light"
+                              startContent={<RotateCcw className="h-3.5 w-3.5" />}
+                              onPress={() => requestRestoreVersion(comparison.left!.id)}
+                            >
+                              恢复左侧
+                            </Button>
+                          ) : null}
                         </div>
+                        <p className="border-b border-stone-100 bg-stone-50 px-3 py-1.5 text-[11px] leading-4 text-stone-500">
+                          恢复不会整体覆盖：先预览旧稿采用、新注保留与词级引用迁移清单；旧快照已解决而当前又出现新来源的冲突会阻断写入。
+                        </p>
                         <div className="max-h-72 space-y-2 overflow-y-auto p-2">
                           {comparison.changes.map((change) => (
                             <button
@@ -1087,6 +1284,215 @@ export function TextAnnotationWorkbench() {
           </Card>
         </aside>
       </main>
+
+      <Modal
+        isOpen={restorePlan !== null}
+        onClose={closeRestorePreview}
+        size="3xl"
+        scrollBehavior="inside"
+        aria-label="版本恢复清单"
+      >
+        {restorePlan ? (
+          <ModalContent>
+            {() => (
+              <>
+                <ModalHeader className="flex-col items-start gap-1">
+                  <div className="flex items-center gap-2">
+                    <RotateCcw className="h-4 w-4 text-stone-600" />
+                    <span>恢复清单 · {restorePlan.snapshotLabel}</span>
+                  </div>
+                  <p className="text-xs font-normal leading-5 text-stone-500">
+                    先确认下列保留结果再写入：旧稿正文只覆盖对应句子，新补的正文与注释会保留；词级引用在词语消失时迁到所属句。
+                  </p>
+                </ModalHeader>
+                <ModalBody>
+                  {restorePlan.regressedConflicts.length ? (
+                    <div role="alert" className="space-y-3 rounded-xl border border-red-200 bg-red-50 p-4">
+                      <div className="flex items-start gap-2">
+                        <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-red-600" />
+                        <div>
+                          <h3 className="text-sm font-bold text-red-800">
+                            检出 {restorePlan.regressedConflicts.length} 组已解决冲突在当前出现新来源
+                          </h3>
+                          <p className="mt-1 text-xs leading-5 text-red-700">
+                            这些冲突在旧快照中已按来源解决，当前又有新的来源或条文。请先逐条处理，恢复已停在预览，任何句子和注释都不会写入。
+                          </p>
+                        </div>
+                      </div>
+                      <div className="space-y-2">
+                        {restorePlan.regressedConflicts.map((conflict) => (
+                          <div key={conflict.key} className="rounded-lg border border-red-200 bg-white p-3">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <Chip size="sm" color="danger" variant="flat">{kindLabel(conflict.kind)}</Chip>
+                              <span className="line-clamp-1 font-serif text-xs text-stone-700">{conflict.anchorLabel}</span>
+                            </div>
+                            <p className="mt-1.5 text-[11px] leading-4 text-stone-500">
+                              旧稿已解决来源：{conflict.snapshotSources.join('、')}
+                            </p>
+                            <div className="mt-2 space-y-1.5">
+                              {conflict.currentSources.map((source) => (
+                                <button
+                                  key={source.annotationId}
+                                  type="button"
+                                  className="block w-full rounded-md border border-red-100 bg-red-50/60 p-2 text-left hover:border-red-300"
+                                  onClick={() => focusRegressedAnnotation(source.annotationId)}
+                                >
+                                  <div className="flex items-center justify-between gap-2 text-xs">
+                                    <b className="text-red-800">{source.source}</b>
+                                    <span className="text-red-500">前往处理 →</span>
+                                  </div>
+                                  <p className="mt-0.5 line-clamp-2 text-[11px] leading-4 text-stone-600">{source.body}</p>
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                      {restoreBlockedAcknowledged ? (
+                        <p className="text-xs font-semibold text-red-700">
+                          已按要求停在预览：未写入任何句子或注释。请关闭弹窗或点击上方来源先解决冲突。
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : null}
+
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    <RestoreStatChip
+                      tone="amber"
+                      icon={<ArrowDownToLine className="h-3.5 w-3.5" />}
+                      count={restorePlan.revertSentences.length}
+                      label="句将采用旧稿"
+                    />
+                    <RestoreStatChip
+                      tone="green"
+                      icon={<FileDown className="h-3.5 w-3.5" />}
+                      count={restorePlan.newSentences.length}
+                      label="新补正文句保留"
+                    />
+                    <RestoreStatChip
+                      tone="green"
+                      icon={<Plus className="h-3.5 w-3.5" />}
+                      count={restorePlan.newAnnotations.length}
+                      label="新注释保留"
+                    />
+                    <RestoreStatChip
+                      tone="green"
+                      icon={<Pencil className="h-3.5 w-3.5" />}
+                      count={restorePlan.revisedAnnotations.length}
+                      label="注释修订保留"
+                    />
+                    <RestoreStatChip
+                      tone="blue"
+                      icon={<RotateCcw className="h-3.5 w-3.5" />}
+                      count={restorePlan.restoredSentences.length}
+                      label="旧稿被删句恢复"
+                    />
+                    <RestoreStatChip
+                      tone="blue"
+                      icon={<RotateCcw className="h-3.5 w-3.5" />}
+                      count={restorePlan.restoredAnnotations.length}
+                      label="旧稿注释恢复"
+                    />
+                    <RestoreStatChip
+                      tone="orange"
+                      icon={<Link2 className="h-3.5 w-3.5" />}
+                      count={restorePlan.migratedWordAnnotations.length}
+                      label="词级引用迁到所属句"
+                    />
+                  </div>
+
+                  <RestorePreviewSection
+                    tone="amber"
+                    title="采用旧稿的句子"
+                    empty="没有正文会被旧稿覆盖。"
+                    items={restorePlan.revertSentences.map((item) => ({
+                      key: item.id,
+                      title: `${item.chapterTitle} · 第 ${item.order} 句`,
+                      detail: `当前：${item.currentText}  →  旧稿：${item.snapshotText}`
+                    }))}
+                  />
+
+                  <RestorePreviewSection
+                    tone="green"
+                    title="保留的新补正文与新注释"
+                    empty="没有快照之后新增的句子或注释。"
+                    items={[
+                      ...restorePlan.newSentences.map((item) => ({
+                        key: `s-${item.id}`,
+                        title: `${item.chapterTitle} · 第 ${item.order} 句（新句保留）`,
+                        detail: item.text
+                      })),
+                      ...restorePlan.newAnnotations.map((item) => ({
+                        key: `a-new-${item.id}`,
+                        title: `新注释保留 · ${item.title}`,
+                        detail: `${item.anchorLabel}｜${item.source}：${item.body}`
+                      }))
+                    ]}
+                  />
+
+                  <RestorePreviewSection
+                    tone="green"
+                    title="保留的注释修订"
+                    empty="既有注释没有快照之后的修订。"
+                    items={restorePlan.revisedAnnotations.map((item) => ({
+                      key: `a-rev-${item.id}`,
+                      title: `修订保留 · ${item.title}`,
+                      detail: `${item.anchorLabel}｜${item.source}`
+                    }))}
+                  />
+
+                  <RestorePreviewSection
+                    tone="orange"
+                    title="词级引用迁到所属句"
+                    empty="旧稿正文中所有被引用词语都还在，无需迁移。"
+                    items={restorePlan.migratedWordAnnotations.map((item) => ({
+                      key: `a-mig-${item.id}`,
+                      title: `“${item.wordText}” → ${item.sentenceLabel}`,
+                      detail: `${item.title}｜${item.source}：${item.body}`
+                    }))}
+                  />
+
+                  <RestorePreviewSection
+                    tone="blue"
+                    title="随旧稿恢复的句子与注释"
+                    empty="旧稿没有当前缺失的句子或注释。"
+                    items={[
+                      ...restorePlan.restoredSentences.map((item) => ({
+                        key: `rs-${item.id}`,
+                        title: `${item.chapterTitle} · 第 ${item.order} 句（旧稿恢复）`,
+                        detail: item.text
+                      })),
+                      ...restorePlan.restoredAnnotations.map((item) => ({
+                        key: `a-res-${item.id}`,
+                        title: `旧稿注释恢复 · ${item.title}`,
+                        detail: `${item.anchorLabel}｜${item.source}：${item.body}`
+                      }))
+                    ]}
+                  />
+                </ModalBody>
+                <ModalFooter>
+                  <Button variant="light" startContent={<X className="h-4 w-4" />} onPress={closeRestorePreview}>
+                    取消
+                  </Button>
+                  <Button
+                    color={restorePlan.regressedConflicts.length ? 'danger' : 'primary'}
+                    startContent={
+                      restorePlan.regressedConflicts.length ? (
+                        <AlertTriangle className="h-4 w-4" />
+                      ) : (
+                        <Check className="h-4 w-4" />
+                      )
+                    }
+                    onPress={confirmRestore}
+                  >
+                    {restorePlan.regressedConflicts.length ? '仍有冲突，无法写入' : '确认按清单恢复'}
+                  </Button>
+                </ModalFooter>
+              </>
+            )}
+          </ModalContent>
+        ) : null}
+      </Modal>
 
       <footer className="mx-auto max-w-[1800px] px-6 pb-8 text-center text-xs text-stone-400">
         数据保存在当前浏览器；清除站点数据会同时删除离线草稿与版本快照。
